@@ -19,4 +19,5 @@ global-exclude *.dll
 global-exclude *.a
 global-exclude *.obj
 exclude aiohttp/*.html
+exclude aiohttp/_vendored/brotli_src/c/.gitignore
 prune docs/_build

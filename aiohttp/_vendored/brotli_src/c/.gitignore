@@ -1,0 +1,4 @@
+# CVE-2025-69223: the repository root .gitignore ignores every ``include/``
+# directory (virtualenv scaffolding), which would drop the vendored Brotli
+# public headers (include/brotli/*.h). Re-include the directory here.
+!include/

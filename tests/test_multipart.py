@@ -10,6 +10,8 @@ import pytest
 
 import aiohttp
 from aiohttp import payload
+from aiohttp.abc import AbstractStreamWriter
+from aiohttp.compression_utils import DEFAULT_MAX_DECOMPRESS_SIZE
 from aiohttp.hdrs import (
     CONTENT_DISPOSITION,
     CONTENT_ENCODING,
@@ -33,14 +35,14 @@ def buf():
 
 
 @pytest.fixture
-def stream(buf):
-    writer = mock.Mock()
+def stream(buf: bytearray) -> AbstractStreamWriter:
+    writer = mock.create_autospec(AbstractStreamWriter, instance=True, spec_set=True)
 
     async def write(chunk):
         buf.extend(chunk)
 
     writer.write.side_effect = write
-    return writer
+    return writer  # type: ignore[no-any-return]
 
 
 @pytest.fixture
@@ -350,6 +352,34 @@ class TestPartReader:
             )
             with pytest.raises(RuntimeError):
                 await obj.read(decode=True)
+
+    @pytest.mark.parametrize("encoding", ("deflate", "gzip"))
+    async def test_decode_content_encoding_bomb_is_capped(self, encoding: str) -> None:
+        # CVE-2025-69223: decoding a compressed body part must not inflate a
+        # tiny payload without bound.
+        original = b"A" * (64 * 2**20)
+        wbits = 16 + zlib.MAX_WBITS if encoding == "gzip" else -zlib.MAX_WBITS
+        compressor = zlib.compressobj(wbits=wbits)
+        bomb = compressor.compress(original) + compressor.flush()
+        assert len(bomb) < 2**20
+        assert len(original) > DEFAULT_MAX_DECOMPRESS_SIZE
+
+        with Stream(b"") as stream:
+            obj = aiohttp.BodyPartReader(
+                BOUNDARY, {CONTENT_ENCODING: encoding}, stream
+            )
+            result = obj.decode(bomb)
+        assert len(result) <= DEFAULT_MAX_DECOMPRESS_SIZE
+        assert result == b"A" * len(result)
+
+        with Stream(b"") as stream:
+            obj = aiohttp.BodyPartReader(
+                BOUNDARY,
+                {CONTENT_ENCODING: encoding},
+                stream,
+                max_decompress_size=1024,
+            )
+            assert len(obj.decode(bomb)) <= 1024
 
     async def test_read_with_content_transfer_encoding_base64(self) -> None:
         with Stream(b"VGltZSB0byBSZWxheCE=%s--:--" % newline) as stream:
@@ -1072,7 +1102,9 @@ async def test_writer(writer) -> None:
     assert writer.boundary == ":"
 
 
-async def test_writer_serialize_io_chunk(buf, stream, writer) -> None:
+async def test_writer_serialize_io_chunk(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     with io.BytesIO(b"foobarbaz") as file_handle:
         writer.append(file_handle)
         await writer.write(stream)
@@ -1082,7 +1114,9 @@ async def test_writer_serialize_io_chunk(buf, stream, writer) -> None:
     )
 
 
-async def test_writer_serialize_json(buf, stream, writer) -> None:
+async def test_writer_serialize_json(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     writer.append_json({"привет": "мир"})
     await writer.write(stream)
     assert (
@@ -1091,7 +1125,9 @@ async def test_writer_serialize_json(buf, stream, writer) -> None:
     )
 
 
-async def test_writer_serialize_form(buf, stream, writer) -> None:
+async def test_writer_serialize_form(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     data = [("foo", "bar"), ("foo", "baz"), ("boo", "zoo")]
     writer.append_form(data)
     await writer.write(stream)
@@ -1099,7 +1135,9 @@ async def test_writer_serialize_form(buf, stream, writer) -> None:
     assert b"foo=bar&foo=baz&boo=zoo" in buf
 
 
-async def test_writer_serialize_form_dict(buf, stream, writer) -> None:
+async def test_writer_serialize_form_dict(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     data = {"hello": "мир"}
     writer.append_form(data)
     await writer.write(stream)
@@ -1107,7 +1145,9 @@ async def test_writer_serialize_form_dict(buf, stream, writer) -> None:
     assert b"hello=%D0%BC%D0%B8%D1%80" in buf
 
 
-async def test_writer_write(buf, stream, writer) -> None:
+async def test_writer_write(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     writer.append("foo-bar-baz")
     writer.append_json({"test": "passed"})
     writer.append_form({"test": "passed"})
@@ -1153,7 +1193,9 @@ async def test_writer_write(buf, stream, writer) -> None:
     ) == bytes(buf)
 
 
-async def test_writer_write_no_close_boundary(buf, stream) -> None:
+async def test_writer_write_no_close_boundary(
+    buf: bytearray, stream: AbstractStreamWriter
+) -> None:
     writer = aiohttp.MultipartWriter(boundary=":")
     writer.append("foo-bar-baz")
     writer.append_json({"test": "passed"})
@@ -1185,12 +1227,18 @@ async def test_writer_write_no_close_boundary(buf, stream) -> None:
     ) == bytes(buf)
 
 
-async def test_writer_write_no_parts(buf, stream, writer) -> None:
+async def test_writer_write_no_parts(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     await writer.write(stream)
     assert b"--:--\r\n" == bytes(buf)
 
 
-async def test_writer_serialize_with_content_encoding_gzip(buf, stream, writer):
+async def test_writer_serialize_with_content_encoding_gzip(
+    buf: bytearray,
+    stream: AbstractStreamWriter,
+    writer: aiohttp.MultipartWriter,
+) -> None:
     writer.append("Time to Relax!", {CONTENT_ENCODING: "gzip"})
     await writer.write(stream)
     headers, message = bytes(buf).split(b"\r\n\r\n", 1)
@@ -1206,7 +1254,9 @@ async def test_writer_serialize_with_content_encoding_gzip(buf, stream, writer):
     assert b"Time to Relax!" == data
 
 
-async def test_writer_serialize_with_content_encoding_deflate(buf, stream, writer):
+async def test_writer_serialize_with_content_encoding_deflate(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     writer.append("Time to Relax!", {CONTENT_ENCODING: "deflate"})
     await writer.write(stream)
     headers, message = bytes(buf).split(b"\r\n\r\n", 1)
@@ -1220,7 +1270,9 @@ async def test_writer_serialize_with_content_encoding_deflate(buf, stream, write
     assert thing == message
 
 
-async def test_writer_serialize_with_content_encoding_identity(buf, stream, writer):
+async def test_writer_serialize_with_content_encoding_identity(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     thing = b"\x0b\xc9\xccMU(\xc9W\x08J\xcdI\xacP\x04\x00"
     writer.append(thing, {CONTENT_ENCODING: "identity"})
     await writer.write(stream)
@@ -1235,12 +1287,16 @@ async def test_writer_serialize_with_content_encoding_identity(buf, stream, writ
     assert thing == message.split(b"\r\n")[0]
 
 
-def test_writer_serialize_with_content_encoding_unknown(buf, stream, writer):
+def test_writer_serialize_with_content_encoding_unknown(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     with pytest.raises(RuntimeError):
         writer.append("Time to Relax!", {CONTENT_ENCODING: "snappy"})
 
 
-async def test_writer_with_content_transfer_encoding_base64(buf, stream, writer):
+async def test_writer_with_content_transfer_encoding_base64(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     writer.append("Time to Relax!", {CONTENT_TRANSFER_ENCODING: "base64"})
     await writer.write(stream)
     headers, message = bytes(buf).split(b"\r\n\r\n", 1)
@@ -1253,7 +1309,9 @@ async def test_writer_with_content_transfer_encoding_base64(buf, stream, writer)
     assert b"VGltZSB0byBSZWxheCE=" == message.split(b"\r\n")[0]
 
 
-async def test_writer_content_transfer_encoding_quote_printable(buf, stream, writer):
+async def test_writer_content_transfer_encoding_quote_printable(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     writer.append("Привет, мир!", {CONTENT_TRANSFER_ENCODING: "quoted-printable"})
     await writer.write(stream)
     headers, message = bytes(buf).split(b"\r\n\r\n", 1)
@@ -1269,7 +1327,9 @@ async def test_writer_content_transfer_encoding_quote_printable(buf, stream, wri
     )
 
 
-def test_writer_content_transfer_encoding_unknown(buf, stream, writer) -> None:
+def test_writer_content_transfer_encoding_unknown(
+    buf: bytearray, stream: AbstractStreamWriter, writer: aiohttp.MultipartWriter
+) -> None:
     with pytest.raises(RuntimeError):
         writer.append("Time to Relax!", {CONTENT_TRANSFER_ENCODING: "unknown"})
 
@@ -1393,7 +1453,9 @@ class TestMultipartWriter:
             with aiohttp.MultipartWriter(boundary=":") as writer:
                 writer.append(None)
 
-    async def test_write_preserves_content_disposition(self, buf, stream) -> None:
+    async def test_write_preserves_content_disposition(
+        self, buf: bytearray, stream: AbstractStreamWriter
+    ) -> None:
         with aiohttp.MultipartWriter(boundary=":") as writer:
             part = writer.append(b"foo", headers={CONTENT_TYPE: "test/passed"})
             part.set_content_disposition("form-data", filename="bug")
@@ -1410,7 +1472,9 @@ class TestMultipartWriter:
         )
         assert message == b"foo\r\n--:--\r\n"
 
-    async def test_preserve_content_disposition_header(self, buf, stream):
+    async def test_preserve_content_disposition_header(
+        self, buf: bytearray, stream: AbstractStreamWriter
+    ) -> None:
         # https://github.com/aio-libs/aiohttp/pull/3475#issuecomment-451072381
         with pathlib.Path(__file__).open("rb") as fobj:
             with aiohttp.MultipartWriter("form-data", boundary=":") as writer:
@@ -1434,7 +1498,9 @@ class TestMultipartWriter:
             b'Content-Disposition: attachments; filename="bug.py"'
         )
 
-    async def test_set_content_disposition_override(self, buf, stream):
+    async def test_set_content_disposition_override(
+        self, buf: bytearray, stream: AbstractStreamWriter
+    ) -> None:
         # https://github.com/aio-libs/aiohttp/pull/3475#issuecomment-451072381
         with pathlib.Path(__file__).open("rb") as fobj:
             with aiohttp.MultipartWriter("form-data", boundary=":") as writer:
@@ -1458,7 +1524,9 @@ class TestMultipartWriter:
             b'Content-Disposition: attachments; filename="bug.py"'
         )
 
-    async def test_reset_content_disposition_header(self, buf, stream):
+    async def test_reset_content_disposition_header(
+        self, buf: bytearray, stream: AbstractStreamWriter
+    ) -> None:
         # https://github.com/aio-libs/aiohttp/pull/3475#issuecomment-451072381
         with pathlib.Path(__file__).open("rb") as fobj:
             with aiohttp.MultipartWriter("form-data", boundary=":") as writer:
