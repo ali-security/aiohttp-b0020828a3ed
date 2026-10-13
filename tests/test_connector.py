@@ -1231,6 +1231,52 @@ async def test_tcp_connector_use_dns_cache_disabled(loop, dns_response) -> None:
         await conn.close()
 
 
+async def _fake_resolve(host: str, port: int, family: int = 0) -> List[ResolveResult]:
+    return [
+        {
+            "hostname": host,
+            "host": "127.0.0.1",
+            "port": port,
+            "family": socket.AF_INET,
+            "proto": 0,
+            "flags": socket.AI_NUMERICHOST,
+        }
+    ]
+
+
+async def test_tcp_connector_dns_cache_max_size(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    with mock.patch("aiohttp.connector.DefaultResolver") as m_resolver:
+        m_resolver().resolve.side_effect = _fake_resolve
+        conn = aiohttp.TCPConnector(use_dns_cache=True, dns_cache_max_size=10)
+        for i in range(50):
+            await conn._resolve_host(f"host{i}.example.com", 80)
+
+        assert len(conn._cached_hosts._addrs_rr) == 10
+        assert len(conn._cached_hosts._timestamps) == 10
+        assert ("host49.example.com", 80) in conn._cached_hosts
+        assert ("host0.example.com", 80) not in conn._cached_hosts
+
+        await conn.close()
+
+
+async def test_tcp_connector_dns_cache_default_max_size(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    # Resolving many unique hostnames must not grow the DNS cache unbounded.
+    with mock.patch("aiohttp.connector.DefaultResolver") as m_resolver:
+        m_resolver().resolve.side_effect = _fake_resolve
+        conn = aiohttp.TCPConnector(use_dns_cache=True, ttl_dns_cache=None)
+        for i in range(1005):
+            await conn._resolve_host(f"host{i}.example.com", 80)
+
+        assert len(conn._cached_hosts._addrs_rr) == 1000
+        assert len(conn._cached_hosts._timestamps) <= 1000
+
+        await conn.close()
+
+
 async def test_tcp_connector_dns_throttle_requests(loop, dns_response) -> None:
     with mock.patch("aiohttp.connector.DefaultResolver") as m_resolver:
         conn = aiohttp.TCPConnector(loop=loop, use_dns_cache=True, ttl_dns_cache=10)
@@ -3351,6 +3397,25 @@ async def test_named_pipe_connector(
 
 
 class TestDNSCacheTable:
+    host1 = ("localhost", 80)
+    host2 = ("foo", 80)
+    result1: ResolveResult = {
+        "hostname": "localhost",
+        "host": "127.0.0.1",
+        "port": 80,
+        "family": socket.AF_INET,
+        "proto": 0,
+        "flags": socket.AI_NUMERICHOST,
+    }
+    result2: ResolveResult = {
+        "hostname": "foo",
+        "host": "127.0.0.2",
+        "port": 80,
+        "family": socket.AF_INET,
+        "proto": 0,
+        "flags": socket.AI_NUMERICHOST,
+    }
+
     @pytest.fixture
     def dns_cache_table(self):
         return _DNSCacheTable()
@@ -3435,6 +3500,63 @@ class TestDNSCacheTable:
 
         addrs = dns_cache_table.next_addrs("foo")
         assert addrs == ["127.0.0.1"]
+
+    def test_max_size_eviction(self) -> None:
+        table = _DNSCacheTable(max_size=2)
+
+        table.add(self.host1, [self.result1])
+        table.add(self.host2, [self.result2])
+
+        host3 = ("example.com", 80)
+        result3: ResolveResult = {
+            **self.result1,
+            "hostname": "example.com",
+            "host": "1.2.3.4",
+        }
+        table.add(host3, [result3])
+
+        assert len(table._addrs_rr) == 2
+        assert self.host1 not in table._addrs_rr
+        assert host3 in table._addrs_rr
+
+    def test_lru_eviction(self) -> None:
+        table = _DNSCacheTable(max_size=2)
+
+        table.add(self.host1, [self.result1])
+        table.add(self.host2, [self.result2])
+
+        table.next_addrs(self.host1)
+
+        host3 = ("example.com", 80)
+        result3: ResolveResult = {
+            **self.result1,
+            "hostname": "example.com",
+            "host": "1.2.3.4",
+        }
+        table.add(host3, [result3])
+
+        assert self.host1 in table._addrs_rr
+        assert self.host2 not in table._addrs_rr
+
+    def test_lru_eviction_add(self) -> None:
+        table = _DNSCacheTable(max_size=2)
+
+        table.add(self.host1, [self.result1])
+        table.add(self.host2, [self.result2])
+
+        # Re-add, thus making host1 the most recently used.
+        table.add(self.host1, [self.result1])
+
+        host3 = ("example.com", 80)
+        result3: ResolveResult = {
+            **self.result1,
+            "hostname": "example.com",
+            "host": "1.2.3.4",
+        }
+        table.add(host3, [result3])
+
+        assert self.host1 in table._addrs_rr
+        assert self.host2 not in table._addrs_rr
 
 
 async def test_connector_cache_trace_race():
