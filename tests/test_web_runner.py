@@ -52,6 +52,9 @@ async def test_runner_setup_handle_signals(make_runner: Any) -> None:
     platform.system() == "Windows", reason="the test is not valid for Windows"
 )
 async def test_runner_setup_without_signal_handling(make_runner: Any) -> None:
+    # Seal: start from the default disposition — a SIGTERM handler left behind by
+    # proxy.py (test_proxy_functional) in the same xdist worker made this flaky.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     runner = make_runner(handle_signals=False)
     await runner.setup()
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
