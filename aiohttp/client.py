@@ -191,6 +191,7 @@ class _RequestOptions(TypedDict, total=False):
     auto_decompress: Union[bool, None]
     max_line_size: Union[int, None]
     max_field_size: Union[int, None]
+    max_headers: Union[int, None]
 
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
@@ -254,6 +255,7 @@ class ClientSession:
             "_read_bufsize",
             "_max_line_size",
             "_max_field_size",
+            "_max_headers",
             "_resolve_charset",
             "_default_proxy",
             "_default_proxy_auth",
@@ -297,6 +299,7 @@ class ClientSession:
         read_bufsize: int = 2**16,
         max_line_size: int = 8190,
         max_field_size: int = 8190,
+        max_headers: int = 128,
         fallback_charset_resolver: _CharsetResolver = lambda r, b: "utf-8",
     ) -> None:
         # We initialise _connector to None immediately, as it's referenced in __del__()
@@ -385,6 +388,7 @@ class ClientSession:
         self._read_bufsize = read_bufsize
         self._max_line_size = max_line_size
         self._max_field_size = max_field_size
+        self._max_headers = max_headers
 
         # Convert to list of tuples
         if headers:
@@ -502,6 +506,7 @@ class ClientSession:
         auto_decompress: Optional[bool] = None,
         max_line_size: Optional[int] = None,
         max_field_size: Optional[int] = None,
+        max_headers: Optional[int] = None,
     ) -> ClientResponse:
 
         # NOTE: timeout clamps existing connect and read timeouts.  We cannot
@@ -589,6 +594,9 @@ class ClientSession:
 
         if max_field_size is None:
             max_field_size = self._max_field_size
+
+        if max_headers is None:
+            max_headers = self._max_headers
 
         traces = [
             Trace(
@@ -721,6 +729,7 @@ class ClientSession:
                         timeout_ceil_threshold=self._connector._timeout_ceil_threshold,
                         max_line_size=max_line_size,
                         max_field_size=max_field_size,
+                        max_headers=max_headers,
                     )
 
                     try:
