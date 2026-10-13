@@ -13,7 +13,7 @@ import tarfile
 import time
 import zipfile
 import zlib
-from typing import Any, AsyncIterator, Awaitable, Callable, List, Type
+from typing import Any, AsyncIterator, Awaitable, Callable, List, NoReturn, Type
 from unittest import mock
 
 try:
@@ -25,7 +25,7 @@ except ImportError:
     brotli = None  # pragma: no cover
 
 import pytest
-from multidict import MultiDict
+from multidict import CIMultiDict, MultiDict
 from yarl import URL
 
 import aiohttp
@@ -3112,6 +3112,8 @@ async def test_drop_auth_on_redirect_to_other_host(
     async def srv_to(request):
         assert request.host == url_to.host
         assert "Authorization" not in request.headers, "Header wasn't dropped"
+        assert "Proxy-Authorization" not in request.headers
+        assert "Cookie" not in request.headers
         return web.Response()
 
     server_from = await create_server_for_url_and_handler(url_from, srv_from)
@@ -3154,11 +3156,16 @@ async def test_drop_auth_on_redirect_to_other_host(
         resp = await client.get(
             url_from,
             auth=aiohttp.BasicAuth("user", "pass"),
+            headers={"Proxy-Authorization": "Basic dXNlcjpwYXNz", "Cookie": "a=b"},
         )
         assert resp.status == 200
         resp = await client.get(
             url_from,
-            headers={"Authorization": "Basic dXNlcjpwYXNz"},
+            headers={
+                "Authorization": "Basic dXNlcjpwYXNz",
+                "Proxy-Authorization": "Basic dXNlcjpwYXNz",
+                "Cookie": "a=b",
+            },
         )
         assert resp.status == 200
 
@@ -3226,6 +3233,134 @@ async def test_auth_persist_on_redirect_to_other_host_with_global_auth(
     ) as client:
         resp = await client.get(url_from)
         assert resp.status == 200
+
+
+async def test_drop_duplicate_auth_headers_on_redirect_to_other_host(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """Every copy of a credential header is dropped, not just the first one."""
+
+    async def srv_from(request: web.Request) -> NoReturn:
+        assert list(request.headers.getall("Authorization")) == [
+            "Basic first",
+            "Basic second",
+        ]
+        raise web.HTTPFound(server_to.make_url("/path2"))
+
+    async def srv_to(request: web.Request) -> web.Response:
+        assert "Authorization" not in request.headers, "Header wasn't dropped"
+        assert "Proxy-Authorization" not in request.headers
+        assert "Cookie" not in request.headers
+        return web.Response()
+
+    app_from = web.Application()
+    app_from.router.add_get("/path1", srv_from)
+    server_from = await aiohttp_server(app_from)
+
+    app_to = web.Application()
+    app_to.router.add_get("/path2", srv_to)
+    server_to = await aiohttp_server(app_to)
+
+    # Two servers on the same host but different ports are different origins,
+    # so following the redirect must strip the credential headers.
+    headers = CIMultiDict(
+        (
+            ("Authorization", "Basic first"),
+            ("Authorization", "Basic second"),
+            ("Proxy-Authorization", "Basic first"),
+            ("Proxy-Authorization", "Basic second"),
+            ("Cookie", "a=b"),
+            ("Cookie", "c=d"),
+        )
+    )
+
+    url = server_from.make_url("/path1")
+    async with aiohttp.ClientSession() as client:
+        async with client.get(url, headers=headers) as resp:
+            assert resp.status == 200
+
+
+async def test_drop_cookie_header_on_redirect_to_other_host(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """An explicit ``Cookie`` header is not forwarded across an origin."""
+
+    async def srv_from(request: web.Request) -> NoReturn:
+        assert request.headers["Cookie"] == "session=secret"
+        raise web.HTTPFound(server_to.make_url("/path2"))
+
+    async def srv_to(request: web.Request) -> web.Response:
+        assert "Cookie" not in request.headers, "Cookie wasn't dropped"
+        return web.Response()
+
+    app_from = web.Application()
+    app_from.router.add_get("/path1", srv_from)
+    server_from = await aiohttp_server(app_from)
+
+    app_to = web.Application()
+    app_to.router.add_get("/path2", srv_to)
+    server_to = await aiohttp_server(app_to)
+
+    url = server_from.make_url("/path1")
+    async with aiohttp.ClientSession() as client:
+        async with client.get(url, headers={"Cookie": "session=secret"}) as resp:
+            assert resp.status == 200
+
+
+async def test_drop_request_cookies_on_redirect_to_other_host(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """Per-request ``cookies`` are not rebuilt into a cross-origin redirect."""
+
+    async def srv_from(request: web.Request) -> NoReturn:
+        assert request.cookies == {"session": "secret"}
+        raise web.HTTPFound(server_to.make_url("/path2"))
+
+    async def srv_to(request: web.Request) -> web.Response:
+        assert "Cookie" not in request.headers, "Cookie wasn't dropped"
+        return web.Response()
+
+    app_from = web.Application()
+    app_from.router.add_get("/path1", srv_from)
+    server_from = await aiohttp_server(app_from)
+
+    app_to = web.Application()
+    app_to.router.add_get("/path2", srv_to)
+    server_to = await aiohttp_server(app_to)
+
+    url = server_from.make_url("/path1")
+    async with aiohttp.ClientSession() as client:
+        async with client.get(url, cookies={"session": "secret"}) as resp:
+            assert resp.status == 200
+
+
+async def test_drop_redirect_response_cookies_on_redirect_to_other_host(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """Cookies set by the redirecting origin are not replayed to another origin."""
+
+    async def srv_from(request: web.Request) -> NoReturn:
+        raise web.HTTPFound(
+            server_to.make_url("/path2"),
+            headers={"Set-Cookie": "session=secret; Path=/"},
+        )
+
+    async def srv_to(request: web.Request) -> web.Response:
+        assert "Cookie" not in request.headers, "Cookie wasn't dropped"
+        return web.Response()
+
+    app_from = web.Application()
+    app_from.router.add_get("/path1", srv_from)
+    server_from = await aiohttp_server(app_from)
+
+    app_to = web.Application()
+    app_to.router.add_get("/path2", srv_to)
+    server_to = await aiohttp_server(app_to)
+
+    url = server_from.make_url("/path1")
+    async with aiohttp.ClientSession() as client:
+        async with client.get(url) as resp:
+            assert resp.status == 200
 
 
 async def test_drop_auth_on_redirect_to_other_host_with_global_auth_and_base_url(
